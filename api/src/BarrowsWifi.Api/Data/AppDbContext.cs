@@ -35,6 +35,10 @@ public class AppDbContext : DbContext
         {
             e.ToTable("Campaigns");
             e.Property(x => x.BudgetZar).HasPrecision(12, 2);
+            e.Property(x => x.CreateRequestKey).HasMaxLength(100);
+            e.HasIndex(x => x.CreateRequestKey)
+                .IsUnique()
+                .HasFilter("[CreateRequestKey] IS NOT NULL");
             e.HasMany(x => x.Outlets).WithOne().HasForeignKey(x => x.CampaignId);
         });
 
@@ -50,8 +54,25 @@ public class AppDbContext : DbContext
             e.ToTable("ConnectionEvents");
             e.Property(x => x.ReceivedAt).HasDefaultValueSql("SYSDATETIMEOFFSET()");
         });
+        
+b.Entity<CampaignSummary>(e =>
+{
+    e.ToTable("CampaignSummaries");
+    e.HasIndex(x => x.CampaignId).IsUnique();
+});
 
-        b.Entity<CampaignSummary>().ToTable("CampaignSummaries");
-        b.Entity<SentEmail>().ToTable("SentEmails");
+b.Entity<SentEmail>(e =>
+{
+    e.ToTable("SentEmails");
+
+    e.Property(x => x.IdempotencyKey)
+        .HasMaxLength(200);
+
+    e.HasIndex(x => x.IdempotencyKey)
+        .IsUnique()
+        .HasFilter("[IdempotencyKey] IS NOT NULL");
+});
+
+
     }
 }

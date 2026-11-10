@@ -5,7 +5,6 @@ using BarrowsWifi.Api.Messaging;
 using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
 using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -24,17 +23,7 @@ builder.Services
     .AddJwtBearer(o =>
     {
         o.MapInboundClaims = false;
-        o.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidIssuer = jwt.Issuer,
-            ValidAudience = jwt.Audience,
-            IssuerSigningKey = jwt.Key(),
-            ValidateIssuerSigningKey = true,
-            // Portal tablets in some outlets have badly drifted clocks; disabled until we sort out NTP. (KES-198)
-            ValidateLifetime = false,
-            NameClaimType = ClaimNames.Email,
-            RoleClaimType = ClaimNames.Role,
-        };
+        o.TokenValidationParameters = jwt.CreateTokenValidationParameters();
     });
 builder.Services.AddAuthorization(o =>
 {

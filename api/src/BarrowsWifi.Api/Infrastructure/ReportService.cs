@@ -15,35 +15,58 @@ public record CampaignReport(
     int UniqueUsers,
     int SurveyCompletes);
 
+public static class ReportEventQueries
+{
+    public static IQueryable<ConnectionEvent> ForCampaign(
+        IQueryable<ConnectionEvent> events,
+        IQueryable<CampaignOutlet> campaignOutlets,
+        Campaign campaign) =>
+        events.Where(e =>
+            e.CampaignId == campaign.Id &&
+            campaignOutlets.Any(co =>
+                co.CampaignId == campaign.Id &&
+                co.OutletId == e.OutletId) &&
+            e.OccurredAt >= campaign.StartsAt &&
+            e.OccurredAt < campaign.EndsAt);
+
+    public static IQueryable<Guid> DistinctEventIds(
+        this IQueryable<ConnectionEvent> events,
+        string eventType) =>
+        events
+            .Where(e => e.EventType == eventType)
+            .Select(e => e.EventId)
+            .Distinct();
+}
+
 public class ReportService
 {
     private readonly AppDbContext _db;
 
     public ReportService(AppDbContext db) => _db = db;
 
-    public async Task<CampaignReport?> BuildAsync(int campaignId, CancellationToken ct)
+    public async Task<CampaignReport?> BuildAsync(int campaignId, CurrentUser user, CancellationToken ct)
     {
         var campaign = await _db.Campaigns
+            .VisibleTo(user)
             .Include(c => c.Organisation)
             .FirstOrDefaultAsync(c => c.Id == campaignId, ct);
         if (campaign is null) return null;
 
-        // Events at the campaign's outlets during the flight
-        var events =
-            from e in _db.ConnectionEvents
-            join co in _db.CampaignOutlets on e.OutletId equals co.OutletId
-            where co.CampaignId == campaignId
-                  && e.OccurredAt >= campaign.StartsAt
-                  && e.OccurredAt < campaign.EndsAt
-            select e;
-
-        var impressions = await events.CountAsync(e => e.EventType == EventTypes.AdComplete, ct);
+        var events = ReportEventQueries.ForCampaign(
+            _db.ConnectionEvents,
+            _db.CampaignOutlets,
+            campaign);
+        var impressions = await events
+            .DistinctEventIds(EventTypes.AdComplete)
+            .CountAsync(ct);
         var uniqueUsers = await events
             .Where(e => e.EventType == EventTypes.AdComplete)
             .Select(e => e.DeviceHash)
             .Distinct()
             .CountAsync(ct);
-        var surveys = await events.CountAsync(e => e.EventType == EventTypes.SurveyComplete, ct);
+        var surveys = await events
+            .DistinctEventIds(EventTypes.SurveyComplete)
+            .CountAsync(ct);
         var outlets = await _db.CampaignOutlets.CountAsync(co => co.CampaignId == campaignId, ct);
 
         return new CampaignReport(

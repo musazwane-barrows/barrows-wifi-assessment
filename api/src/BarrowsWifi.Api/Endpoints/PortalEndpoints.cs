@@ -1,10 +1,11 @@
+
 using BarrowsWifi.Api.Data;
 using BarrowsWifi.Api.Domain;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 
 namespace BarrowsWifi.Api.Endpoints;
 
-/// <summary>Event as posted by the captive portal.</summary>
 public record IngestEventRequest(
     Guid EventId,
     string StpNumber,
@@ -14,42 +15,113 @@ public record IngestEventRequest(
     DateTimeOffset OccurredAt,
     string? Msisdn);
 
-public record PortalConfig(string StpNumber, string OutletName, int? CampaignId, string? CampaignName, string? Sponsor);
+public record PortalConfig(
+    string StpNumber,
+    string OutletName,
+    int? CampaignId,
+    string? CampaignName,
+    string? Sponsor);
 
 public static class PortalEndpoints
 {
     public static void MapPortalEndpoints(this IEndpointRouteBuilder app)
     {
-        var group = app.MapGroup("/api/portal").WithTags("Captive portal")
+        var group = app.MapGroup("/api/portal")
+            .WithTags("Captive portal")
             .AddEndpointFilter<ApiKeyFilter>();
 
-        // What the portal should show at an outlet right now.
-        group.MapGet("/{stp}", async (string stp, AppDbContext db, CancellationToken ct) =>
+        group.MapGet("/{stp}", async (
+            string stp,
+            AppDbContext db,
+            CancellationToken ct) =>
         {
-            if (!StpNumber.TryNormalise(stp, out var normalised)) return Results.BadRequest("Invalid STP number.");
-            var outlet = await db.Outlets.FirstOrDefaultAsync(o => o.StpNumber == normalised, ct);
-            if (outlet is null) return Results.NotFound();
+            if (!StpNumber.TryNormalise(stp, out var normalised))
+                return Results.BadRequest("Invalid STP number.");
+
+            var outlet = await db.Outlets
+                .FirstOrDefaultAsync(o => o.StpNumber == normalised, ct);
+
+            if (outlet is null)
+                return Results.NotFound();
 
             var now = DateTimeOffset.UtcNow;
+
             var campaign = await db.Campaigns
                 .Include(c => c.Organisation)
                 .Where(c => c.Outlets.Any(co => co.OutletId == outlet.Id))
-                .Where(c => c.Status == CampaignStatus.Live && c.StartsAt <= now && c.EndsAt > now)
+                .Where(c => c.Status == CampaignStatus.Live &&
+                            c.StartsAt <= now &&
+                            c.EndsAt > now)
                 .OrderBy(c => c.StartsAt)
                 .FirstOrDefaultAsync(ct);
 
-            return Results.Ok(new PortalConfig(outlet.StpNumber, outlet.Name, campaign?.Id, campaign?.Name, campaign?.Organisation?.Name));
+            return Results.Ok(new PortalConfig(
+                outlet.StpNumber,
+                outlet.Name,
+                campaign?.Id,
+                campaign?.Name,
+                campaign?.Organisation?.Name));
         });
 
-        group.MapPost("/events", async (IngestEventRequest req, AppDbContext db, ILogger<IngestEventRequest> log, CancellationToken ct) =>
+        group.MapPost("/events", async (
+            IngestEventRequest req,
+            AppDbContext db,
+            ILogger<IngestEventRequest> log,
+            CancellationToken ct) =>
         {
-            log.LogInformation("Portal event received {@Event}", req);
+            // Avoid logging device identifiers and phone numbers.
+            log.LogInformation(
+                "Portal event received {EventId} for outlet {StpNumber}: {EventType}",
+                req.EventId,
+                req.StpNumber,
+                req.EventType);
 
-            if (!EventTypes.All.Contains(req.EventType)) return Results.BadRequest("Unknown event type.");
-            if (!StpNumber.TryNormalise(req.StpNumber, out var stp)) return Results.BadRequest("Invalid STP number.");
+            if (req.EventId == Guid.Empty)
+                return Results.BadRequest("EventId is required.");
 
-            var outletId = await db.Outlets.Where(o => o.StpNumber == stp).Select(o => (int?)o.Id).FirstOrDefaultAsync(ct);
-            if (outletId is null) return Results.BadRequest("Unknown outlet.");
+            if (!EventTypes.All.Contains(req.EventType))
+                return Results.BadRequest("Unknown event type.");
+
+            if (string.IsNullOrWhiteSpace(req.DeviceHash) ||
+                req.DeviceHash.Length > 64)
+                return Results.BadRequest("Invalid device identifier.");
+
+            if (!StpNumber.TryNormalise(req.StpNumber, out var stp))
+                return Results.BadRequest("Invalid STP number.");
+
+            var outletId = await db.Outlets
+                .Where(o => o.StpNumber == stp)
+                .Select(o => (int?)o.Id)
+                .FirstOrDefaultAsync(ct);
+
+            if (outletId is null)
+                return Results.BadRequest("Unknown outlet.");
+
+            if ((req.EventType == EventTypes.AdComplete ||
+                 req.EventType == EventTypes.SurveyComplete) &&
+                !req.CampaignId.HasValue)
+                return Results.BadRequest(
+                    "This event type requires a campaign.");
+
+            if (req.CampaignId.HasValue)
+            {
+                var campaignMatchesOutlet =
+                    await db.Campaigns.AnyAsync(c =>
+                        c.Id == req.CampaignId.Value &&
+                        c.Outlets.Any(co =>
+                            co.OutletId == outletId.Value) &&
+                        c.StartsAt <= req.OccurredAt &&
+                        c.EndsAt > req.OccurredAt, ct);
+
+                if (!campaignMatchesOutlet)
+                    return Results.BadRequest(
+                        "Campaign is not valid for this outlet and event time.");
+            }
+
+            // Idempotency check for ordinary retries.
+            if (await db.ConnectionEvents.AnyAsync(
+                e => e.EventId == req.EventId, ct))
+                return Results.Accepted();
 
             db.ConnectionEvents.Add(new ConnectionEvent
             {
@@ -59,25 +131,44 @@ public static class PortalEndpoints
                 DeviceHash = req.DeviceHash,
                 EventType = req.EventType,
                 OccurredAt = req.OccurredAt,
-                Msisdn = req.Msisdn,
+                Msisdn = req.Msisdn
             });
-            await db.SaveChangesAsync(ct);
+
+            try
+            {
+                await db.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException ex)
+                when (ex.GetBaseException() is SqlException sql &&
+                      (sql.Number == 2601 || sql.Number == 2627))
+            {
+                // A concurrent retry was already inserted.
+                return Results.Accepted();
+            }
+
             return Results.Accepted();
         });
     }
 }
 
-/// <summary>Portal calls authenticate with a shared API key in the X-Api-Key header.</summary>
 public class ApiKeyFilter : IEndpointFilter
 {
     private readonly IConfiguration _config;
 
-    public ApiKeyFilter(IConfiguration config) => _config = config;
+    public ApiKeyFilter(IConfiguration config) =>
+        _config = config;
 
-    public async ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
+    public async ValueTask<object?> InvokeAsync(
+        EndpointFilterInvocationContext context,
+        EndpointFilterDelegate next)
     {
-        var provided = context.HttpContext.Request.Headers["X-Api-Key"].ToString();
-        if (provided != _config["Ingest:ApiKey"]) return Results.Unauthorized();
+        var provided = context.HttpContext.Request
+            .Headers["X-Api-Key"].ToString();
+
+        if (provided != _config["Ingest:ApiKey"])
+            return Results.Unauthorized();
+
         return await next(context);
     }
 }
+

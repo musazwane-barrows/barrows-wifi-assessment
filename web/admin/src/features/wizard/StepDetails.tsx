@@ -1,30 +1,44 @@
-import { useState } from 'react'
+
 import { Button, Input, Label } from '../../components/ui'
-import type { CampaignDraft } from './campaignDraft'
+import type { CampaignDraft, DraftErrors } from './campaignDraft'
 
-export function StepDetails({ onNext }: { onNext: (values: Partial<CampaignDraft>) => void }) {
-  const [name, setName] = useState('')
-  const [objective, setObjective] = useState('')
+interface Props {
+  draft: CampaignDraft
+  errors: DraftErrors
+  onChange: (values: Partial<CampaignDraft>) => void
+  onNext: () => void
+}
 
+export function StepDetails({ draft, errors, onChange, onNext }: Props) {
   return (
     <div className="space-y-4">
       <div>
         <Label htmlFor="name">Campaign name</Label>
-        <Input id="name" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Festive Teaser" />
+        <Input
+          id="name"
+          value={draft.name}
+          onChange={e => onChange({ name: e.target.value })}
+          placeholder="e.g. Festive Teaser"
+          aria-invalid={!!errors.name}
+          aria-describedby={errors.name ? 'name-error' : undefined}
+        />
+        {errors.name && <p id="name-error" className="mt-1 text-sm text-red-600">{errors.name}</p>}
       </div>
+
       <div>
         <Label htmlFor="objective">Objective</Label>
         <textarea
           id="objective"
           className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
           rows={3}
-          value={objective}
-          onChange={(e) => setObjective(e.target.value)}
+          value={draft.objective}
+          onChange={e => onChange({ objective: e.target.value })}
           placeholder="What should this campaign achieve?"
         />
       </div>
+
       <div className="flex justify-end">
-        <Button onClick={() => onNext({ name, objective })}>Next</Button>
+        <Button type="button" onClick={onNext}>Next</Button>
       </div>
     </div>
   )

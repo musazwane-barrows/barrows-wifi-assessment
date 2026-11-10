@@ -42,6 +42,17 @@ public class JwtOptions
     public int LifetimeMinutes { get; set; } = 60;
 
     public SymmetricSecurityKey Key() => new(Encoding.UTF8.GetBytes(SigningKey));
+
+    public TokenValidationParameters CreateTokenValidationParameters() => new()
+    {
+        ValidIssuer = Issuer,
+        ValidAudience = Audience,
+        IssuerSigningKey = Key(),
+        ValidateIssuerSigningKey = true,
+        ValidateLifetime = true,
+        NameClaimType = ClaimNames.Email,
+        RoleClaimType = ClaimNames.Role,
+    };
 }
 
 public class TokenService

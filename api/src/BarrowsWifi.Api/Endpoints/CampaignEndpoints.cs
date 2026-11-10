@@ -2,147 +2,175 @@ using System.Security.Claims;
 using BarrowsWifi.Api.Data;
 using BarrowsWifi.Api.Domain;
 using BarrowsWifi.Api.Infrastructure;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 
 namespace BarrowsWifi.Api.Endpoints;
 
-public record CampaignListItem(int Id, string Name, string Organisation, string Status,
-    DateTimeOffset StartsAt, DateTimeOffset EndsAt, decimal BudgetZar, int OutletCount);
+public record CampaignListItem(
+    int Id,
+    string Name,
+    string Organisation,
+    string Status,
+    DateTimeOffset StartsAt,
+    DateTimeOffset EndsAt,
+    decimal BudgetZar,
+    int OutletCount);
 
-public record CampaignDetail(int Id, int OrganisationId, string Name, string Status,
-    DateTimeOffset StartsAt, DateTimeOffset EndsAt, decimal BudgetZar, int[] OutletIds,
-    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public record CampaignPagedResult<T>(
+    IReadOnlyList<T> Items,
+    int Page,
+    int PageSize,
+    int Total);
 
-public record SaveCampaignRequest(
+public record CreateCampaignRequest(
     string Name,
     DateTimeOffset StartsAt,
     DateTimeOffset EndsAt,
     decimal BudgetZar,
-    int[] OutletIds,
-    string? Status,
-    int? OrganisationId);
-
-public record PagedResult<T>(IReadOnlyList<T> Items, int Page, int PageSize, int Total);
+    IReadOnlyList<int> OutletIds,
+    string? Status = null,
+    int? OrganisationId = null);
 
 public static class CampaignEndpoints
 {
+    public static bool MatchesRequest(
+        Campaign campaign,
+        CreateCampaignRequest request,
+        int organisationId,
+        IReadOnlyCollection<int> outletIds)
+    {
+        var requestedName = request.Name?.Trim();
+        return campaign.OrganisationId == organisationId &&
+            campaign.Name == requestedName &&
+            campaign.StartsAt == request.StartsAt &&
+            campaign.EndsAt == request.EndsAt &&
+            campaign.BudgetZar == request.BudgetZar &&
+            campaign.Outlets.Select(o => o.OutletId).Order().SequenceEqual(outletIds.Order());
+    }
+
     public static void MapCampaignEndpoints(this IEndpointRouteBuilder app)
     {
-        var group = app.MapGroup("/api/campaigns").WithTags("Campaigns").RequireAuthorization();
+        var group = app.MapGroup("/api/campaigns")
+            .WithTags("Campaigns")
+            .RequireAuthorization();
 
-        group.MapGet("/", async (ClaimsPrincipal principal, AppDbContext db, string? status, int? page, int? pageSize, CancellationToken ct) =>
+        group.MapGet("/", async (
+            ClaimsPrincipal principal,
+            AppDbContext db,
+            int? page,
+            int? pageSize,
+            CancellationToken ct) =>
         {
-            var user = CurrentUser.From(principal);
-            var p = page is null or < 1 ? 1 : page.Value;
+            var currentPage = page is null or < 1 ? 1 : page.Value;
             var size = pageSize is null or < 1 or > 100 ? 25 : pageSize.Value;
-
-            var query = db.Campaigns.Include(c => c.Organisation).VisibleTo(user);
-            if (!string.IsNullOrWhiteSpace(status)) query = query.Where(c => c.Status == status);
+            var query = db.Campaigns
+                .AsNoTracking()
+                .VisibleTo(CurrentUser.From(principal));
 
             var total = await query.CountAsync(ct);
-            var campaigns = await query
-                .OrderByDescending(c => c.StartsAt)
-                .Skip((p - 1) * size)
+            var items = await query
+                .OrderByDescending(c => c.CreatedAt)
+                .Skip((currentPage - 1) * size)
                 .Take(size)
+                .Select(c => new CampaignListItem(
+                    c.Id,
+                    c.Name,
+                    c.Organisation!.Name,
+                    c.Status,
+                    c.StartsAt,
+                    c.EndsAt,
+                    c.BudgetZar,
+                    c.Outlets.Count))
                 .ToListAsync(ct);
 
-            var items = new List<CampaignListItem>();
-            foreach (var c in campaigns)
-            {
-                var outletCount = await db.CampaignOutlets.CountAsync(co => co.CampaignId == c.Id, ct);
-                items.Add(new CampaignListItem(c.Id, c.Name, c.Organisation!.Name, c.Status,
-                    c.StartsAt, c.EndsAt, c.BudgetZar, outletCount));
-            }
-
-            return Results.Ok(new PagedResult<CampaignListItem>(items, p, size, total));
+            return Results.Ok(new CampaignPagedResult<CampaignListItem>(
+                items,
+                currentPage,
+                size,
+                total));
         });
 
-        group.MapGet("/{id:int}", async (int id, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
+        group.MapPost("/", async (
+            CreateCampaignRequest request,
+            HttpRequest httpRequest,
+            ClaimsPrincipal principal,
+            AppDbContext db,
+            CancellationToken ct) =>
         {
             var user = CurrentUser.From(principal);
-            var c = await db.Campaigns.VisibleTo(user)
-                .Include(x => x.Outlets)
-                .FirstOrDefaultAsync(x => x.Id == id, ct);
-            return c is null ? Results.NotFound() : Results.Ok(ToDetail(c));
-        });
+            var requestKey = httpRequest.Headers["Idempotency-Key"].FirstOrDefault()?.Trim();
+            if (string.IsNullOrWhiteSpace(requestKey))
+                return Results.BadRequest();
 
-        group.MapPost("/", async (SaveCampaignRequest req, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
-        {
-            var user = CurrentUser.From(principal);
-            var errors = await ValidateAsync(req, db, ct);
-            if (errors.Count > 0) return Results.ValidationProblem(errors);
+            var name = request.Name?.Trim();
+            var organisationId = user.IsPlatformAdmin
+                ? request.OrganisationId ?? user.OrganisationId
+                : user.OrganisationId;
+            var outletIds = request.OutletIds?.Distinct().ToArray() ?? Array.Empty<int>();
+
+            if (string.IsNullOrWhiteSpace(name) || name.Length > 200 ||
+                request.StartsAt >= request.EndsAt || request.BudgetZar <= 0 ||
+                outletIds.Length == 0 || requestKey.Length > 100)
+                return Results.BadRequest();
+
+            var existing = await db.Campaigns
+                .AsNoTracking()
+                .Include(c => c.Outlets)
+                .FirstOrDefaultAsync(c => c.CreateRequestKey == requestKey, ct);
+            if (existing is not null)
+                return MatchesRequest(existing, request, organisationId, outletIds)
+                    ? Results.Ok(new { id = existing.Id })
+                    : Results.Conflict();
+
+            var organisationExists = await db.Organisations
+                .AnyAsync(o => o.Id == organisationId, ct);
+            if (!organisationExists)
+                return Results.BadRequest();
+
+            var activeOutletCount = await db.Outlets
+                .CountAsync(o => outletIds.Contains(o.Id) && o.IsActive, ct);
+            if (activeOutletCount != outletIds.Length)
+                return Results.BadRequest();
 
             var now = DateTimeOffset.UtcNow;
             var campaign = new Campaign
             {
-                OrganisationId = user.IsPlatformAdmin && req.OrganisationId.HasValue ? req.OrganisationId.Value : user.OrganisationId,
-                Name = req.Name.Trim(),
+                OrganisationId = organisationId,
+                Name = name,
                 Status = CampaignStatus.Draft,
-                StartsAt = req.StartsAt,
-                EndsAt = req.EndsAt,
-                BudgetZar = req.BudgetZar,
+                StartsAt = request.StartsAt,
+                EndsAt = request.EndsAt,
+                BudgetZar = request.BudgetZar,
+                CreateRequestKey = requestKey,
                 CreatedAt = now,
                 UpdatedAt = now,
-                Outlets = req.OutletIds.Distinct().Select(id => new CampaignOutlet { OutletId = id }).ToList(),
+                Outlets = outletIds.Select(id => new CampaignOutlet { OutletId = id }).ToList()
             };
+
             db.Campaigns.Add(campaign);
-            await db.SaveChangesAsync(ct);
-            return Results.Created($"/api/campaigns/{campaign.Id}", ToDetail(campaign));
-        }).RequireAuthorization("CanEditCampaigns");
-
-        group.MapPut("/{id:int}", async (int id, SaveCampaignRequest req, ClaimsPrincipal principal, AppDbContext db, CancellationToken ct) =>
-        {
-            var user = CurrentUser.From(principal);
-            var campaign = await db.Campaigns.VisibleTo(user)
-                .Include(x => x.Outlets)
-                .FirstOrDefaultAsync(x => x.Id == id, ct);
-            if (campaign is null) return Results.NotFound();
-
-            var errors = await ValidateAsync(req, db, ct);
-            if (!string.IsNullOrWhiteSpace(req.Status) && req.Status != campaign.Status
-                && !CampaignRules.CanTransition(campaign.Status, req.Status))
+            try
             {
-                errors["status"] = new[] { $"Cannot move a campaign from {campaign.Status} to {req.Status}." };
+                await db.SaveChangesAsync(ct);
             }
-            if (errors.Count > 0) return Results.ValidationProblem(errors);
+            catch (DbUpdateException ex)
+                when (ex.GetBaseException() is SqlException sql &&
+                      (sql.Number == 2601 || sql.Number == 2627))
+            {
+                var existingAfterRace = await db.Campaigns
+                    .AsNoTracking()
+                    .Include(c => c.Outlets)
+                    .FirstOrDefaultAsync(c => c.CreateRequestKey == requestKey, ct);
 
-            campaign.Name = req.Name.Trim();
-            campaign.StartsAt = req.StartsAt;
-            campaign.EndsAt = req.EndsAt;
-            campaign.BudgetZar = req.BudgetZar;
-            if (!string.IsNullOrWhiteSpace(req.Status)) campaign.Status = req.Status;
-            campaign.UpdatedAt = DateTimeOffset.UtcNow;
+                if (existingAfterRace is null) throw;
 
-            var wanted = req.OutletIds.Distinct().ToHashSet();
-            campaign.Outlets.RemoveAll(o => !wanted.Contains(o.OutletId));
-            foreach (var outletId in wanted.Where(w => campaign.Outlets.All(o => o.OutletId != w)))
-                campaign.Outlets.Add(new CampaignOutlet { CampaignId = campaign.Id, OutletId = outletId });
+                return MatchesRequest(existingAfterRace, request, organisationId, outletIds)
+                    ? Results.Ok(new { id = existingAfterRace.Id })
+                    : Results.Conflict();
+            }
 
-            await db.SaveChangesAsync(ct);
-            return Results.Ok(ToDetail(campaign));
-        });
-    }
-
-    private static CampaignDetail ToDetail(Campaign c) => new(
-        c.Id, c.OrganisationId, c.Name, c.Status, c.StartsAt, c.EndsAt, c.BudgetZar,
-        c.Outlets.Select(o => o.OutletId).ToArray(), c.CreatedAt, c.UpdatedAt);
-
-    private static async Task<Dictionary<string, string[]>> ValidateAsync(SaveCampaignRequest req, AppDbContext db, CancellationToken ct)
-    {
-        var errors = new Dictionary<string, string[]>();
-        if (string.IsNullOrWhiteSpace(req.Name)) errors["name"] = new[] { "Name is required." };
-        if (req.EndsAt <= req.StartsAt) errors["endsAt"] = new[] { "End must be after start." };
-        if (req.BudgetZar <= 0) errors["budgetZar"] = new[] { "Budget must be greater than zero." };
-        if (req.OutletIds is null || req.OutletIds.Length == 0)
-        {
-            errors["outletIds"] = new[] { "Select at least one outlet." };
-        }
-        else
-        {
-            var ids = req.OutletIds.Distinct().ToArray();
-            var found = await db.Outlets.CountAsync(o => ids.Contains(o.Id) && o.IsActive, ct);
-            if (found != ids.Length) errors["outletIds"] = new[] { "One or more outlets are unknown or inactive." };
-        }
-        return errors;
+            return Results.Created($"/api/campaigns/{campaign.Id}", new { id = campaign.Id });
+        })
+        .RequireAuthorization("CanEditCampaigns");
     }
 }
